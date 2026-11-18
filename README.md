@@ -47,7 +47,9 @@ The renderer uses the DRM render node for both decoding and presentation. On a m
 
 On NVIDIA, Vulkan Video uses the card's hardware video decoder through the graphics driver. The Vulkan setup above is sufficient. `CUDA_DISABLE_PERF_BOOST=1` was tested on a separate CUDA-backed prototype. It lowered whole-card power from about 79–80 W to 64–65 W while increasing the prototype's CPU load. [CUDA experiment](docs/low-memory-alternatives.md#what-worked-on-the-rtx-4090)
 
-Four output buffers per display are reused after Wayland releases them. At 1440p, their pixel payload totals about 169 MiB for three displays, plus alignment, decoder storage and driver/compositor allocations. Frames stay in GPU memory during decoding and conversion. With presentation feedback available, `--stats` reports submissions, actual display confirmations, discarded commits, completed loops and the longest interval between presentations.
+Four output buffers per display are reused after Wayland releases them. At 1440p, their pixel payload totals about 169 MiB for three displays, plus alignment, decoder storage and driver/compositor allocations. Frames stay in GPU memory during decoding and conversion. Where EGL can export a native fence, the player sleeps until Linux signals that conversion has completed. The player falls back to `glFinish` when the fence is unavailable. [EGL native fence synchronization](https://registry.khronos.org/EGL/extensions/ANDROID/EGL_ANDROID_native_fence_sync.txt)
+
+`--stats` enables Wayland presentation feedback where supported. It reports submissions, actual display confirmations, discarded commits, completed loops and the longest interval between presentations.
 
 A session helper can pass `--pause-socket PATH` and send Unix datagrams containing `pause` or `resume`, a tab, and a Wayland output name. A systemd service can use `Type=notify` to wait for the first submission on every selected output.
 
@@ -59,22 +61,24 @@ WALLPAPER_TEST_RENDER_NODE=/dev/dri/renderD128 \
   cargo test --release --locked --features vulkan renders_asymmetric_color_chart -- --ignored
 ```
 
-On the three-display validation setup, a 140-second run presented all 4,200 frames per display at 30 fps, with zero discarded commits and 6–10 completed loops per video. The process held 147 file descriptors throughout the sampled run. The player used about 5.4% of a logical core during the sampled steady-state interval. Six desktop RGB samples from a frozen Aurora Lake frame matched the libmpv backend within one level per channel.
+Before the native fence change, a 140-second validation run presented all 4,200 frames per display at 30 fps, with zero discarded commits and 6–10 completed loops per video. The process held 147 file descriptors throughout the sampled run. The player used about 5.4% of a logical core during the sampled steady-state interval. Six desktop RGB samples from a frozen Aurora Lake frame matched the libmpv backend within one level per channel.
 
 ## Desktop comparison
 
-These measurements use three independent 2560 × 1440 H.264 loops on a Core i9-14900K, RTX 4090 and Hyprland 0.57.2. The mpv rows used libmpv 0.42 and NVDEC. The Vulkan row was taken after installation, with all three outputs playing.
+These measurements use three independent 2560 × 1440 H.264 loops on a Core i9-14900K, RTX 4090 and Hyprland 0.57.2. The mpv rows used libmpv 0.42 and NVDEC. The Vulkan row uses the original `glFinish` build with all three outputs playing.
 
 | Player | Output rate per monitor | Player CPU | Player memory (PSS) |
 | --- | ---: | ---: | ---: |
 | mpvpaper | 30 fps source | 8.12% | 710 MiB |
 | wallpaper-loop with libmpv | 30 fps submitted | 7.49% | 598 MiB |
 | wallpaper-loop with libmpv and `--frame-step 2` | 15 fps submitted | 6.24% | 596 MiB |
-| wallpaper-loop with Vulkan Video | 30 fps | **5.24%** | **382 MiB** |
+| wallpaper-loop with Vulkan Video and `glFinish` | 30 fps | **5.24%** | **382 MiB** |
 
-At 30 fps, the installed Vulkan player used about **35% less player CPU** and **46% less player RAM** than the earlier mpvpaper baseline. The two 30 fps mpv rows average two 16-second samples per player. The 15 fps row uses one 16-second sample. The installed Vulkan row uses a later 12-second sample. CPU is summed user and system time from `/proc/<pid>/stat`, with 100% representing one logical core. Memory is summed proportional set size (PSS) from `/proc/<pid>/smaps_rollup`.
+At 30 fps, the original Vulkan player used about **35% less player CPU** and **46% less player RAM** than the earlier mpvpaper baseline. The two 30 fps mpv rows average two 16-second samples per player. The 15 fps row uses one 16-second sample. The Vulkan row uses a later 12-second sample. CPU is summed user and system time from `/proc/<pid>/stat`, with 100% representing one logical core. Memory is summed proportional set size (PSS) from `/proc/<pid>/smaps_rollup`.
 
 In a separate prototype run, the whole RTX 4090 averaged about 64 W with bounded Vulkan playback and 84 W with the Rust libmpv backend. Whole-card readings include the compositor and other GPU activity. [Power measurements and methodology](docs/low-memory-alternatives.md#what-worked-on-the-rtx-4090)
+
+A later comparison on the same three displays measured **39% lower player CPU with native fences**, from **4.89% to 2.98% of one logical core**. The `glFinish` baseline averages two 18-second samples, and the native fence build uses a 60-second sample. Both builds played all three videos at about 30 fps with `--stats` enabled. The native fence run displayed 5,939 of 5,940 submitted frames over 66 seconds, including startup.
 
 ## Research and experiments
 

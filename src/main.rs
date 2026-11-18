@@ -128,9 +128,11 @@ fn run(args: Args) -> Result<()> {
             linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
             presentation_time::client::wp_presentation::WpPresentation,
         };
-        desktop.presentation = globals
-            .bind::<WpPresentation, _, _>(&handle, 1..=1, ())
-            .ok();
+        if args.stats {
+            desktop.presentation = globals
+                .bind::<WpPresentation, _, _>(&handle, 1..=1, ())
+                .ok();
+        }
         let dmabuf: ZwpLinuxDmabufV1 = globals
             .bind(&handle, 3..=3, ())
             .context("Wayland compositor requires Linux DMA-BUF version 3")?;

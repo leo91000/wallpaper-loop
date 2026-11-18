@@ -166,8 +166,11 @@ struct Egl {
     context: egl::Context,
     gl: glow::Context,
     bind_image: BindImage,
+    dup_fence_fd: Option<DupFenceFd>,
     gbm: Gbm,
 }
+
+type DupFenceFd = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
 
 impl Egl {
     fn open(node: &Path) -> Result<Rc<Self>> {
@@ -193,13 +196,57 @@ impl Egl {
                     .map_or(ptr::null(), |proc| proc as *const c_void)
             })
         };
+        let dup_fence_fd = API
+            .query_string(Some(display), egl::EXTENSIONS)
+            .ok()
+            .filter(|extensions| {
+                extensions
+                    .to_bytes()
+                    .split(|byte| *byte == b' ')
+                    .any(|name| name == b"EGL_ANDROID_native_fence_sync")
+            })
+            .and_then(|_| API.get_proc_address("eglDupNativeFenceFDANDROID"))
+            .map(|symbol| unsafe {
+                std::mem::transmute::<extern "system" fn(), DupFenceFd>(symbol)
+            });
         Ok(Rc::new(Self {
             display,
             context,
             gl,
             bind_image,
+            dup_fence_fd,
             gbm,
         }))
+    }
+
+    fn wait_native_fence(&self) -> bool {
+        let Some(dup_fence_fd) = self.dup_fence_fd else {
+            return false;
+        };
+        const NATIVE_FENCE: egl::Enum = 0x3144;
+        let Ok(sync) =
+            (unsafe { API.create_sync(self.display, NATIVE_FENCE, &[egl::ATTRIB_NONE]) })
+        else {
+            return false;
+        };
+        // Flush the fence after the draws so EGL can export it as a sync file.
+        let fd = unsafe {
+            self.gl.flush();
+            let fd = dup_fence_fd(self.display.as_ptr(), sync.as_ptr());
+            let _ = API.destroy_sync(self.display, sync);
+            fd
+        };
+        if fd < 0 {
+            return false;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut event = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut event, 1, 500) };
+        ready == 1 && event.revents == libc::POLLIN
     }
 
     fn configure(display: egl::Display) -> Result<(egl::Context, BindImage)> {
@@ -537,7 +584,10 @@ impl Gpu {
     }
 
     pub fn finish(&self) -> Result<()> {
-        unsafe { self.egl.gl.finish() };
+        if !self.egl.wait_native_fence() {
+            // Preserve completion before releasing decoder images or submitting buffers.
+            unsafe { self.egl.gl.finish() };
+        }
         self.egl.check("convert NV12 to XR24")
     }
 }
