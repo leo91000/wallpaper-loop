@@ -1,6 +1,10 @@
+#[cfg(feature = "vulkan")]
+mod control;
 mod desktop;
 mod gpu;
 mod mpv;
+#[cfg(feature = "vulkan")]
+mod vulkan;
 
 use std::{
     collections::HashSet,
@@ -16,7 +20,13 @@ use calloop_wayland_source::WaylandSource;
 use clap::Parser;
 use wayland_client::{Connection, globals::registry_queue_init};
 
-use desktop::{Desktop, Renderer};
+use desktop::{Desktop, MpvRenderer, Renderer};
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Backend {
+    Mpv,
+    Vulkan,
+}
 
 #[derive(Parser)]
 #[command(version, about = "Play looping videos as Wayland desktop wallpapers")]
@@ -28,6 +38,18 @@ struct Args {
     /// List Wayland output names.
     #[arg(long)]
     list_outputs: bool,
+
+    /// Playback backend. Vulkan requires a build with --features vulkan.
+    #[arg(long, value_enum, default_value = "mpv")]
+    backend: Backend,
+
+    /// DRM render node for the Vulkan backend.
+    #[arg(long)]
+    render_node: Option<PathBuf>,
+
+    /// Unix datagram socket for per-output Vulkan pause and resume messages.
+    #[arg(long)]
+    pause_socket: Option<PathBuf>,
 
     /// libmpv hardware decoding mode (for example auto, nvdec, vaapi, or no).
     #[arg(long, default_value = "auto")]
@@ -66,6 +88,26 @@ fn streams(args: &Args) -> Result<Vec<(String, PathBuf)>> {
 
 fn run(args: Args) -> Result<()> {
     let streams = streams(&args)?;
+    if args.render_node.is_some() {
+        ensure!(
+            matches!(args.backend, Backend::Vulkan),
+            "--render-node requires --backend vulkan"
+        );
+    }
+    if args.pause_socket.is_some() {
+        ensure!(
+            matches!(args.backend, Backend::Vulkan),
+            "--pause-socket requires --backend vulkan"
+        );
+    }
+    if matches!(args.backend, Backend::Vulkan) {
+        ensure!(
+            args.hwdec == "auto",
+            "--hwdec controls only the mpv backend"
+        );
+        #[cfg(not(feature = "vulkan"))]
+        anyhow::bail!("build with --features vulkan to use --backend vulkan");
+    }
     let connection = Connection::connect_to_env().context("connect to Wayland")?;
     let (globals, mut queue) = registry_queue_init::<Desktop>(&connection)?;
     let mut desktop = Desktop::default();
@@ -80,12 +122,37 @@ fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
-    let display = gpu::Display::new(connection.clone())?;
-    let api = Rc::new(mpv::Api::load()?);
+    #[cfg(feature = "vulkan")]
+    let dmabuf = if matches!(args.backend, Backend::Vulkan) {
+        use wayland_protocols::wp::{
+            linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+            presentation_time::client::wp_presentation::WpPresentation,
+        };
+        desktop.presentation = globals
+            .bind::<WpPresentation, _, _>(&handle, 1..=1, ())
+            .ok();
+        let dmabuf: ZwpLinuxDmabufV1 = globals
+            .bind(&handle, 3..=3, ())
+            .context("Wayland compositor requires Linux DMA-BUF version 3")?;
+        queue.roundtrip(&mut desktop)?;
+        Some(dmabuf)
+    } else {
+        None
+    };
     desktop.map(&globals, &handle, streams)?;
 
     let mut reactor = EventLoop::<Desktop>::try_new()?;
-    WaylandSource::new(connection, queue)
+    #[cfg(feature = "vulkan")]
+    if let Some(path) = args.pause_socket.as_deref() {
+        control::PauseSocket::install(path, reactor.handle())?;
+    }
+    #[cfg(feature = "vulkan")]
+    let mut notify = if matches!(args.backend, Backend::Vulkan) {
+        control::notify_address()?
+    } else {
+        None
+    };
+    WaylandSource::new(connection.clone(), queue)
         .insert(reactor.handle())
         .map_err(|e| e.error)?;
     let (wake, updates) = channel::channel();
@@ -102,12 +169,23 @@ fn run(args: Args) -> Result<()> {
         .insert_source(signals, |_, _, state| state.stop())
         .map_err(|e| e.error)?;
 
-    let renderer = Renderer {
-        display,
-        api,
-        wake,
-        hwdec: args.hwdec,
-        frame_step: args.frame_step,
+    let renderer = match args.backend {
+        Backend::Mpv => Renderer::Mpv(MpvRenderer {
+            display: gpu::Display::new(connection.clone())?,
+            api: Rc::new(mpv::Api::load()?),
+            wake,
+            hwdec: args.hwdec,
+            frame_step: args.frame_step,
+        }),
+        #[cfg(feature = "vulkan")]
+        Backend::Vulkan => Renderer::Vulkan(vulkan::Renderer::new(
+            args.render_node.as_deref(),
+            &desktop.drm_modifiers,
+            dmabuf.context("missing Wayland DMA-BUF factory")?,
+            args.frame_step,
+        )?),
+        #[cfg(not(feature = "vulkan"))]
+        Backend::Vulkan => unreachable!("Vulkan feature checked before connecting"),
     };
     let deadline = args
         .duration
@@ -118,12 +196,45 @@ fn run(args: Args) -> Result<()> {
             desktop.verify_presentation()?;
             break;
         }
-        reactor.dispatch(remaining, &mut desktop)?;
+        #[cfg(feature = "vulkan")]
+        let remaining = match (remaining, desktop.next_deadline(&renderer)) {
+            (remaining, None) => remaining,
+            (remaining, Some(next)) => {
+                let frame = next.saturating_duration_since(Instant::now());
+                Some(remaining.map_or(frame, |limit| frame.min(limit)))
+            }
+        };
+        reactor
+            .dispatch(remaining, &mut desktop)
+            .context("dispatch Wayland events")?;
         if !desktop.stopping() {
             desktop.step(&handle, &renderer)?;
+            #[cfg(feature = "vulkan")]
+            if let Some(address) = &notify
+                && desktop.all_outputs_submitted()
+            {
+                connection
+                    .flush()
+                    .context("submit initial wallpaper frames")?;
+                control::notify_ready(address)?;
+                notify = None;
+            }
         }
     }
     if args.stats {
+        #[cfg(feature = "vulkan")]
+        {
+            let until = Instant::now() + Duration::from_millis(120);
+            while desktop.pending_presentation() {
+                let remaining = until.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                reactor
+                    .dispatch(remaining, &mut desktop)
+                    .context("collect presentation feedback")?;
+            }
+        }
         desktop.print_stats();
     }
     Ok(())
