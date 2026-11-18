@@ -1,0 +1,19 @@
+[package]
+name = "wallpaper-loop"
+version = "0.1.0"
+edition = "2024"
+description = "A small GPU-accelerated Wayland video wallpaper player"
+license = "MIT"
+repository = "https://github.com/leo91000/wallpaper-loop"
+
+[dependencies]
+anyhow = "1.0.104"
+calloop = "0.14.5"
+calloop-wayland-source = "0.4.1"
+clap = { version = "4.6.8", features = ["derive"] }
+ctrlc = { version = "3.5.3", features = ["termination"] }
+khronos-egl = { version = "6.0.0", features = ["static"] }
+libloading = "0.9.1"
+wayland-client = { version = "0.31.15", features = ["system"] }
+wayland-egl = "0.32.11"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
